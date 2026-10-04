@@ -473,6 +473,10 @@ print(r.choices[0].message.content)
   part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
   `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
   Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+- **A server-wide output budget (opt-in).** `"force_max_tokens": N` in `strata-<model>.json` replaces every client's
+  `max_tokens` / `max_completion_tokens` with N. Use this when a client sends a low built-in default; it overrides
+  even an explicitly requested smaller limit. The prompt plus N must fit the configured context, unless
+  `"fit_max_tokens": true` is also set.
 - **Anthropic requests that don't ask for thinking (opt-in, 0.1.32, #278).** By default a `/v1/messages` request
   with no `"thinking"`, effort or budget thinks as the model's template does. `"anthropic_thinking": "on_request"` in
   `strata-<model>.json` renders such a request without thinking - Anthropic's own rule, and what Claude Code's short
