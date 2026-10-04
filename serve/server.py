@@ -874,6 +874,16 @@ def engine_silence_s(cfg: dict) -> float:
     return float(v)
 
 
+def configured_force_max_tokens(cfg: dict) -> int | None:
+    """A configured server-wide output budget that replaces a client's max_tokens value."""
+    value = cfg.get("force_max_tokens")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f'"force_max_tokens" must be a positive integer, not {value!r}')
+    return value
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
@@ -1035,6 +1045,7 @@ class Service:
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+        self.force_max_tokens: int | None = None  # config override for clients that send a small default cap
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
@@ -2502,7 +2513,8 @@ def make_handler(svc: Service):
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
-            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            max_req = max_new = svc.force_max_tokens or int(req.get("max_completion_tokens") or
+                                                             req.get("max_tokens") or 0)  # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or []}
             if use_mcp:
@@ -2563,7 +2575,7 @@ def make_handler(svc: Service):
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            max_new = svc.force_max_tokens or int(req.get("max_tokens") or 0)  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
@@ -2952,6 +2964,10 @@ def main() -> int:
                                           "server's model; also \"before_load\" in the config, a string or a list)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    try:
+        force_max_tokens = configured_force_max_tokens(cfg)
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
@@ -3024,6 +3040,9 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    svc.force_max_tokens = force_max_tokens
+    if force_max_tokens is not None:
+        print(f"[strata] forcing max output tokens to {force_max_tokens} for every request", flush=True)
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:

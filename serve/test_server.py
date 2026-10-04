@@ -131,6 +131,21 @@ class MaxTokens(unittest.TestCase):
                 self.assertEqual(self.engine.last_max_new, want)
                 self.assertEqual(ct, want)
 
+    def test_forced_server_budget_replaces_client_budget(self):
+        previous = self.svc.force_max_tokens
+        self.svc.force_max_tokens = 1500
+        try:
+            for api, budget in [("openai", {"max_tokens": 50}),
+                                ("openai", {"max_completion_tokens": 50, "max_tokens": 9}),
+                                ("anthropic", {"max_tokens": 50})]:
+                with self.subTest(api=api, budget=budget):
+                    s, b, _, ct = self.call(api, **budget)
+                    self.assertEqual(s, 200, b)
+                    self.assertEqual(self.engine.last_max_new, 1500)
+                    self.assertEqual(ct, 1500)
+        finally:
+            self.svc.force_max_tokens = previous
+
     def test_explicit_budget_over_the_context_is_rejected(self):
         for api in ("openai", "anthropic"):
             with self.subTest(api=api):
