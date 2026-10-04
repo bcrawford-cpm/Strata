@@ -24,7 +24,18 @@ bool& pdl_scope();
 /// The current device supports PDL and STRATA_DF_PDL is not 0.
 bool pdl_supported();
 
-#if defined(__CUDACC__)
+#if defined(__HIPCC__)
+// HIP has no programmatic dependent launch: both calls are no-ops and a launch is an ordinary one.
+__device__ __forceinline__ void pdl_wait() {}
+__device__ __forceinline__ void pdl_trigger() {}
+
+template <typename... KArgs, typename... Args>
+inline cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t stream,
+                              Args&&... args) {
+    kernel<<<grid, block, smem, stream>>>(std::forward<Args>(args)...);
+    return cudaGetLastError();
+}
+#elif defined(__CUDACC__)
 __device__ __forceinline__ void pdl_wait() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -57,6 +68,6 @@ inline cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, s
     cfg.numAttrs = 1;
     return cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
 }
-#endif  // __CUDACC__
+#endif  // __HIPCC__ / __CUDACC__
 
 }  // namespace strata::kernels

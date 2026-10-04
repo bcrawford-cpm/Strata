@@ -593,11 +593,15 @@ __global__ void l2_prefetch_kernel(L2Regions r, int evict_last) {
     for (int k = 0; k < r.n; ++k) {
         const char* base = (const char*) r.p[k];
         for (unsigned long long off = tid * 128ull; off < r.bytes[k]; off += nt * 128ull) {
+#if defined(__HIPCC__)
+            (void) base; (void) evict_last;   // PTX prefetch only; a hint, so HIP skips it
+#else
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
             if (evict_last) asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(base + off));
             else
 #endif
             asm volatile("prefetch.global.L2 [%0];" ::"l"(base + off));
+#endif
         }
     }
 }
@@ -690,7 +694,13 @@ __global__ void handoff_take_kernel(const float4* hand, int hb4, int T, int hcn4
     const int total = T * per;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
         const int t = i / per, w = i - t * per;
+#if defined(__HIPCC__)
+        // __ldcv has no HIP form: volatile loads of the four floats are not cached either
+        const volatile float* hp = (const volatile float*) (hand + (size_t) t * hb4 + w);
+        const float4 v = make_float4(hp[0], hp[1], hp[2], hp[3]);
+#else
         const float4 v = __ldcv(hand + (size_t) t * hb4 + w);   // mapped memory another GPU wrote: no cached copy
+#endif
         if (w < hcn4) R[(size_t) t * hcn4 + w] = v;
         else if (w < hcn4 + n4) bo[(size_t) t * n4 + (w - hcn4)] = v;
         else inj[(size_t) t * hc4 + (w - hcn4 - n4)] = v;
