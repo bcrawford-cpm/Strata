@@ -223,7 +223,7 @@ def build(gguf: pathlib.Path, out_dir: pathlib.Path, n_layers: int | None, skip_
     # pack_layer reads its own hardcoded SHARD1, so a different --gguf would silently take the expert arena
     # from a different file than the dense tensors.  Refuse rather than produce a mixed-source pack.
     # the expert arena and the dense tensors come from the same file: point pack_layer at it
-    PL.SHARD1 = pathlib.Path(gguf).resolve()
+    PL.SHARD1 = pathlib.Path(gguf).absolute()
     shard2 = pathlib.Path(str(PL.SHARD1).replace("00001-of-00002", "00002-of-00002"))
     man["source"]["shard2"] = str(shard2)
     exp_path = out_dir / "experts.bin"

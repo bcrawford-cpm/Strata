@@ -1425,7 +1425,6 @@ def engine_silence_s(cfg: dict) -> float:
     return float(v)
 
 
-<<<<<<< HEAD
 def configured_force_max_tokens(cfg: dict) -> int | None:
     """A configured server-wide output budget that replaces a client's max_tokens value."""
     value = cfg.get("force_max_tokens")
@@ -1434,7 +1433,8 @@ def configured_force_max_tokens(cfg: dict) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f'"force_max_tokens" must be a positive integer, not {value!r}')
     return value
-=======
+
+
 def layer_split_value(cfg: dict) -> str:
     """#644: the config's "layer_split" as the engine's --layer-split value: "auto" (the default), or the FIRST LAYER of
     each later GPU's share - one rising number per GPU after the first, e.g. "24,36,42" for 4 GPUs (layers 0-23 on the
@@ -1466,7 +1466,6 @@ def layer_split_value(cfg: dict) -> str:
     if vals[0] < 2 or any(b <= a for a, b in zip(vals, vals[1:])):
         raise ValueError(f"{hint}; got {v!r}, which does not rise from 2 or more")
     return ",".join(str(x) for x in vals)
->>>>>>> 6f32ec070f23ced9f50e704d854d775da52591ab
 
 
 def engine_args(cfg: dict) -> list[str]:
