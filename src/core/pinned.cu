@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdlib>
@@ -281,38 +282,61 @@ int arena_pin_cap_gib() {
     return v < 0 ? -1 : v;
 }
 
-namespace {
 #ifdef _WIN32
-// #243: how much of the arena the sliced registration may pin on Windows when the whole arena was refused.
-// Page-locked memory the GPU maps is charged to its shared (non-local) WDDM segment; pinned slice by slice until
-// the driver refused one (28 GiB of a 63 GB PC), that segment was left full and every later cudaMalloc failed
-// "out of memory".  4 GiB of the budget stay free for what the engine allocates after the arena; without the DXGI
-// numbers, RAM/2 - 8 GiB (the budget is about half the RAM).  False: no limit could be worked out.
-bool sliced_pin_limit(uint64_t& limit, std::string& why) {
+// #243: how much of the arena may be pinned on Windows.  Page-locked memory is mapped into EVERY GPU of the process
+// (Portable), and WDDM charges it to each GPU's shared (non-local) segment - but the budget DXGI reports for one GPU
+// is spent by all of them together: pinned slice by slice until the driver refused one (28 GiB of a 63 GB PC), that
+// segment was left full and every later cudaMalloc failed; and on two RX 7900 XT (126 GB RAM, a 102,134 MiB budget)
+// a 49 GiB pin ran while a 50 GiB one - 2 x 51,205 MiB charged - had Windows evict all of the process's VRAM and
+// the next kernel never finished (the IQ3_S arena, 47 GiB, hung every split start).  So the limit is the budget less
+// what every GPU already holds there, less 4 GiB per GPU for what the engine allocates after the arena (KV
+// streaming, mapped buffers), shared out over the GPUs.  Without the DXGI numbers, RAM/2 - 8 GiB over the GPUs (the
+// budget is about half the RAM).  False: no limit could be worked out.
+bool arena_pin_budget(uint64_t& limit, std::string& why) {
     constexpr uint64_t GiB = 1ull << 30;
-    char buf[256];
-    int dev = 0;
-    cudaDeviceProp p{};
-    uint64_t budget = 0, usage = 0;
+    char buf[320];
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess || n < 1) {
+        (void) cudaGetLastError();
+        n = 1;
+    }
+    uint64_t budget = 0, used = 0;
     std::string err = "no CUDA device properties";
-    if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-        strata::platform::gpu_shared_memory_budget(p.luid, budget, usage, err)) {
-        limit = budget > usage + 4 * GiB ? budget - usage - 4 * GiB : 0;
-        std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget %.1f GiB - %.1f GiB in use - 4 GiB",
-                      (double) budget / GiB, (double) usage / GiB);
+    bool ok = true;
+    for (int d = 0; d < n && ok; ++d) {
+        cudaDeviceProp p{};
+        uint64_t b = 0, u = 0;
+        ok = cudaGetDeviceProperties(&p, d) == cudaSuccess &&
+             strata::platform::gpu_shared_memory_budget(p.luid, b, u, err);
+        budget = d == 0 ? b : std::min(budget, b);
+        used += u;
+    }
+    if (ok) {
+        const char* rv = std::getenv("STRATA_ARENA_PIN_RESERVE_GIB");   // the per-GPU reserve (A/B)
+        const uint64_t reserve = rv != nullptr && std::atoi(rv) >= 0 ? (uint64_t) std::atoi(rv) : 4;
+        const uint64_t keep = used + reserve * GiB * (uint64_t) n;
+        limit = budget > keep ? (budget - keep) / (uint64_t) n : 0;
+        std::snprintf(buf, sizeof buf, "the shared-memory budget %.1f GiB - %.1f GiB in use - %llu GiB per GPU, over "
+                      "%d GPU%s", (double) budget / GiB, (double) used / GiB, (unsigned long long) reserve, n,
+                      n == 1 ? "" : "s");
         why = buf;
         return true;
     }
     (void) cudaGetLastError();
     const uint64_t ram = strata::platform::total_physical_memory();
     if (ram == 0) return false;
-    limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
-    std::snprintf(buf, sizeof buf, "%s: RAM/2 - 8 GiB of %.1f GiB", err.c_str(), (double) ram / GiB);
+    limit = ram / 2 > 8 * GiB ? (ram / 2 - 8 * GiB) / (uint64_t) n : 0;
+    std::snprintf(buf, sizeof buf, "%s: RAM/2 - 8 GiB of %.1f GiB, over %d GPU%s", err.c_str(), (double) ram / GiB, n,
+                  n == 1 ? "" : "s");
     why = buf;
     return true;
 }
+#else
+bool arena_pin_budget(uint64_t&, std::string& why) {
+    why = "no DXGI budget off Windows";
+    return false;
+}
 #endif
-}  // namespace
 
 namespace {
 std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
@@ -366,7 +390,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             // #243 (opt-in, STRATA_ARENA_PIN_GIB=auto): not up to the driver's refusal but below the shared-memory
             // budget, for a PC where the full sliced pin leaves WDDM refusing later allocations.  Not the default: a
             // 64 GB PC pins 30 GiB past that budget without trouble, and capping it at 26 cost ~20% prompt speed.
-            if (!capped && env_gib == -2) limited = sliced_pin_limit(limit, limit_why);
+            if (!capped && env_gib == -2) limited = arena_pin_budget(limit, limit_why);
 #endif
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];

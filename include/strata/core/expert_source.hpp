@@ -664,6 +664,9 @@ public:
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's GGUF: `native` is the
     /// --native shard, and native_experts.txt names the other shards beside it (per layer, or per role in v4).
     void set_gguf(const std::string& native) { gguf_ = native; }
+    /// The GPU reads experts straight from the pinned arena (the decode's PCIe share) only below this many bytes of
+    /// it; the rest of the pin still serves the prompt path's copies.  Default: all of the pin.
+    void set_alias_limit(uint64_t bytes) { alias_limit_ = bytes; }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -705,6 +708,7 @@ private:
     double load_read_s_ = 0.0;
     double load_copy_s_ = 0.0;
     uint64_t pinned_bytes_ = 0;
+    uint64_t alias_limit_ = ~0ull;
     std::string gguf_;
 };
 

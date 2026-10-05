@@ -3150,15 +3150,30 @@ int main(int argc, char** argv) {
         // measured on the 5080 + 3090 rig: cudaMemGetInfo and the next cudaMalloc fail.  Unregistered layers remain
         // in the resident arena; their streamed experts go through the pinned staging ring.  A Linux driver has no
         // such limit, so there the whole arena is pinned (#253).  STRATA_ARENA_PIN_GIB overrides both ways.
+        // Native Windows: as much as the shared-memory budget leaves once it is split over the GPUs (every GPU maps
+        // the whole pin; all of them spend one budget, and past it Windows evicted the VRAM and the start hung):
+        // 2x RX 7900 XT, IQ3_S, 43 of the arena's 47 GiB instead of 8.  WSL2 has no DXGI numbers: 8 GiB there.
         const int pin_env = strata::core::arena_pin_cap_gib();   // -1 unset, -2 "auto" (#243, Windows sliced pin)
         const bool pin_wddm_cap = pin_env < 0 && (o.expert_cache_remote[0] > 0 || multi_gpu) && under_wddm();
-        const uint64_t pin_limit = pin_env >= 0 ? (uint64_t) pin_env << 30 : pin_wddm_cap ? (8ull << 30) : 0;
+        uint64_t pin_limit = pin_env >= 0 ? (uint64_t) pin_env << 30 : 0;
+        std::string pin_why;
+        if (pin_wddm_cap) {
+            uint64_t budget = 0;
+            pin_limit = strata::core::arena_pin_budget(budget, pin_why) ? std::max<uint64_t>(budget, 1ull << 20)
+                                                                         : (8ull << 30);
+            // The decode's PCIe share (kernels reading the pinned arena in place) stays on the first 8 GiB, as with
+            // the 8 GiB pin: with 43 of 47 GiB pinned on two RX 7900 XT it answered "!!!!" from the first token in
+            // 5 of 19 starts (none in 8 with --pcie-frac 0, none in 16 with 31 GiB or less pinned).  The prompt
+            // path's copies from the whole pin were never wrong.
+            arena_src.set_alias_limit(8ull << 30);
+        }
         if (pin_env >= 0)
             std::fprintf(stderr, "strata generate: STRATA_ARENA_PIN_GIB=%d: %s\n", pin_env,
                          pin_env == 0 ? "the whole expert arena is pinned" : "the expert arena's pinning is capped");
         else if (pin_wddm_cap)
-            std::fprintf(stderr, "strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned "
-                                 "(STRATA_ARENA_PIN_GIB changes it)\n");
+            std::fprintf(stderr, "strata generate: multi-GPU under WDDM: at most %.1f GiB of the expert arena is pinned "
+                                 "(%s; STRATA_ARENA_PIN_GIB changes it)\n", (double) pin_limit / (1ull << 30),
+                         pin_why.empty() ? "no shared-memory budget to read" : pin_why.c_str());
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());

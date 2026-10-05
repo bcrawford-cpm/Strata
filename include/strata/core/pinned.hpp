@@ -27,6 +27,11 @@ enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 /// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
 int arena_pin_cap_gib();
 
+/// Windows: the most of the expert arena that may be pinned, in bytes - pinned memory is charged to every GPU's
+/// shared segment and all of them spend one budget, so it is the budget less what is in use, less 4 GiB per GPU,
+/// over the GPUs.  `why` says how it was worked out.  False (elsewhere, or no numbers): no limit known.
+bool arena_pin_budget(uint64_t& limit, std::string& why);
+
 struct PinnedArena {
     void* base = nullptr;
     uint64_t capacity = 0;

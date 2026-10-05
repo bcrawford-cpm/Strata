@@ -433,6 +433,14 @@ prompt speed with and without it before keeping it.
 Shipped tables:
 
 - `gfx1100-hipblaslt-100100.txt`, `gfx1100-hipblaslt-100200.txt`: RX 7900 XTX.
+- `gfx1100-hipblaslt-100500.txt`: RX 7900 XT (gfx1100, 20 GB) on Windows 11, calibrated with the ROCm
+  10.2.0a20260930 of the ready-made Windows engine (hipBLASLt 1.5.0; `tune_hipblaslt` built by
+  `tools\hip\build_windows.bat`, run with `engine\rocm\bin`). 16 dense GEMM geometries at T=4096 and T=8192, 32
+  rows (the shapes of the other tables). Without a table the Windows engine's dense prompt GEMMs run on hipBLASEx,
+  which this ROCm runs 3-17x slower than the tuned hipBLASLt kernels at these shapes (347 ms vs 56 ms for the 32
+  cases). End to end, IQ3_S at 32K context, one card: 16K-token prompts 689 -> 1,214 tok/s, 8K 595 -> 974, 2K
+  unchanged (~550), decode unchanged; two cards (layer split 28, `STRATA_STAGE_TRIM=1`, `STRATA_ARENA_PIN_GIB=0`):
+  16K 878 -> 1,540, 8K 655 -> 1,155. No `Lt fallback` with `STRATA_HIPBLASLT_VERBOSE=1`.
 - `gfx1201-hipblaslt-100500.txt`: Radeon AI PRO R9700 (gfx1201, 32 GB), calibrated with ROCm 10.2.0a20260914
   (AMD's `gfx120X-all` nightly, hipBLASLt 1.5.0, library build `d3164197`). 16 dense GEMM geometries at T=4096 and
   T=8192, 32 rows. setup uses it only when the installed hipBLASLt reports 1.5.0 (it is found in `/opt/rocm`

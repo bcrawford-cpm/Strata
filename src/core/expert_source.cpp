@@ -2052,7 +2052,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else {
                     if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
-                        const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
+                        // the GPU reads it in place (pcie_mode != 0) only where the source gives it an address: a
+                        // pinned expert past ArenaExpertSource's alias limit has none, and a fetch from a null
+                        // address stalled every window that routed to it (code prompts: 12 instead of 46 tok/s)
+                        const bool can = d.src->pinned(d.layers, e) &&
+                                         (P.pcie_mode == 0 || d.src->device_alias(d.layers, e) != nullptr);
+                        const uint8_t* src = can ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;
                             dma_src[fetches] = src;
@@ -2965,6 +2970,7 @@ bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (dev_slice_.empty() || !pinned(layer, expert)) return nullptr;
     const auto& lay = strata::kernels::cpu::expert_layout();
+    if (lay.blob_offset(layer, expert) + lay.blob_bytes(layer) > alias_limit_) return nullptr;
     if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
     // one registration slice per layer
     if ((size_t) layer >= dev_slice_.size()) return nullptr;

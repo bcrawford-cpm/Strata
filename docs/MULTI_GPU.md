@@ -139,10 +139,23 @@ into the card that owns the layer.
 - The prompt path has its own buffers on every card (1.5 GB each at the default 2048-token chunk; `--prefill 1024`
   halves that) instead of borrowing cache slots as one card does. An explicit `--expert-cache` on the first card is
   capped to leave room for them.
-- Under WDDM (Windows, and WSL2) only 8 GiB of the expert arena is pinned (more, mapped into two GPU contexts,
-  leaves WDDM refusing allocations); the rest streams through the pinned staging ring. A Linux driver has no such
-  limit, so there the whole arena is pinned (since 0.1.31; the cap cost a 4090 + 3060 split two thirds of its
-  prompt speed, #253). `STRATA_ARENA_PIN_GIB=N` pins at most N GiB, `0` the whole arena, on any OS.
+- Under WDDM the pinned part of the expert arena is limited; the rest streams through the pinned staging ring. A
+  Linux driver has no such limit, so there the whole arena is pinned (since 0.1.31; an 8 GiB cap cost a 4090 + 3060
+  split two thirds of its prompt speed, #253). `STRATA_ARENA_PIN_GIB=N` pins at most N GiB, `0` the whole arena,
+  on any OS.
+  - **Native Windows:** pinned memory is mapped into every GPU of the process, and Windows charges it to each GPU's
+    shared memory, yet all of them spend the one budget DXGI reports (102,134 MiB on a PC with 126 GB of RAM). So
+    the engine pins the budget less what is in use, less 4 GiB per GPU (`STRATA_ARENA_PIN_RESERVE_GIB`), shared
+    out over the GPUs; it logs `at most N GiB of the expert arena is pinned (the shared-memory budget ...)`. Past
+    the budget Windows evicted all of the process's VRAM and the start hung: on 2x RX 7900 XT a test pinning 49 GiB
+    ran and 50 GiB hung, and the IQ3_S arena (47 GiB) pinned whole hung every split start.
+  - With that pin (43.5 of 47 GiB, IQ3_S, 2x RX 7900 XT, 150K context, layer split 28), against the earlier 8 GiB:
+    prompts of 4K / 16K / 32K tokens 394-412 / 685-808 / 901-966 -> 463-498 / 800-947 / 1,102-1,116 tok/s;
+    decode +6-11% (story 32.7 -> 34.8, code 48.1 -> 53.6 tok/s).
+  - The decode's PCIe share (kernels reading the pinned arena in place) stays on the first 8 GiB: with all 43.5 GiB
+    readable that way, 5 of 19 starts answered "!!!!" from the first token (none in 8 with `--pcie-frac 0`, none
+    in 16 with 31 GiB or less pinned, none in 16 with the 8 GiB limit). The prompt path's copies use the whole pin.
+  - WSL2 has no DXGI budget to read: 8 GiB there.
 - Every card needs compute capability 7.5 (RTX 20 or newer). The pre-sm_80 QSA scorer path is fp32 FMAs, so a
   Turing card runs the same kernels instead of the tensor-core prompt attention.
 
