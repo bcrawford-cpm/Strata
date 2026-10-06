@@ -2504,7 +2504,7 @@ class AmdTelemetry(unittest.TestCase):
         from serve import telemetry
         with tempfile.TemporaryDirectory() as d:
             self.tree(d)
-            with mock.patch.object(telemetry, "SYSFS", d):
+            with mock.patch.object(telemetry, "SYSFS", d), mock.patch.object(telemetry, "WINDOWS", False):
                 self.assertTrue(telemetry.amd_device_dir(0).endswith(os.path.join("renderD129", "device")))
                 self.assertTrue(telemetry.amd_device_dir(1).endswith(os.path.join("renderD128", "device")))
                 self.assertIsNone(telemetry.amd_device_dir(2))
@@ -2523,7 +2523,7 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertEqual((s["gpu_mem_used"], s["gpu_util"], s["gpu_temp"], s["gpu_power"]),
                                  (8 << 30, 68.0, 64.0, 205.0))
         with tempfile.TemporaryDirectory() as d:                    # no amdgpu: nothing, and nothing breaks
-            with mock.patch.object(telemetry, "SYSFS", d):
+            with mock.patch.object(telemetry, "SYSFS", d), mock.patch.object(telemetry, "WINDOWS", False):
                 self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
                 self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
 
@@ -2534,7 +2534,7 @@ class AmdTelemetry(unittest.TestCase):
         svc.backend, svc.gpu_index = "hip", 1
         with tempfile.TemporaryDirectory() as d:
             self.tree(d)
-            with mock.patch.object(telemetry, "SYSFS", d):
+            with mock.patch.object(telemetry, "SYSFS", d), mock.patch.object(telemetry, "WINDOWS", False):
                 self.assertEqual(svc.free_vram_mib(), 26 << 10)
 
 

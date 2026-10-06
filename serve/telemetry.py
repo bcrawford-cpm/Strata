@@ -106,6 +106,7 @@ class _Nvml:
 
 # ------------------------------------------------------------------------------------------------ AMD (Linux sysfs)
 SYSFS = "/sys"
+WINDOWS = os.name == "nt"
 
 
 def amd_device_dir(index, sysfs=None):
@@ -182,9 +183,149 @@ class _Amd:
         return out
 
 
+# ------------------------------------------------------------------------------------------------ AMD (Windows)
+def _dxgi_adapters(vendor=0x1002):
+    """[(name, dedicated VRAM bytes, "luid_0x<High>_0x<Low>", as the counters name it)] of the DXGI adapters of one vendor (AMD by default), most
+    VRAM first (as HIP numbers them), software adapters skipped.  Empty off Windows or when DXGI fails."""
+    import ctypes.wintypes as wt
+
+    class Luid(ctypes.Structure):
+        _fields_ = [("Low", wt.DWORD), ("High", wt.LONG)]
+
+    class Desc1(ctypes.Structure):
+        _fields_ = [("Description", ctypes.c_wchar * 128), ("VendorId", wt.UINT), ("DeviceId", wt.UINT),
+                    ("SubSysId", wt.UINT), ("Revision", wt.UINT), ("Dedicated", ctypes.c_size_t),
+                    ("DedicatedSys", ctypes.c_size_t), ("Shared", ctypes.c_size_t), ("Luid", Luid),
+                    ("Flags", wt.UINT)]
+
+    class Guid(ctypes.Structure):
+        _fields_ = [("a", wt.DWORD), ("b", wt.WORD), ("c", wt.WORD), ("d", ctypes.c_ubyte * 8)]
+
+    def method(obj, index, *argtypes):
+        vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vtbl[index])
+
+    out = []
+    try:
+        iid = Guid(0x770AAE78, 0xF26F, 0x4DBA, (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87))
+        fac = ctypes.c_void_p()
+        if ctypes.windll.dxgi.CreateDXGIFactory1(ctypes.byref(iid), ctypes.byref(fac)) != 0 or not fac.value:
+            return out
+        i = 0
+        while True:                                                       # IDXGIFactory1::EnumAdapters1 (slot 12)
+            ad = ctypes.c_void_p()
+            if method(fac, 12, wt.UINT, ctypes.POINTER(ctypes.c_void_p))(fac, i, ctypes.byref(ad)) != 0:
+                break
+            i += 1
+            d = Desc1()
+            if method(ad, 10, ctypes.POINTER(Desc1))(ad, ctypes.byref(d)) == 0 \
+                    and d.VendorId == vendor and not d.Flags & 2:       # IDXGIAdapter1::GetDesc1; 2 = SOFTWARE
+                out.append((d.Description, int(d.Dedicated), f"luid_0x{d.Luid.High & 0xFFFFFFFF:08X}_0x{d.Luid.Low:08X}"))
+            method(ad, 2)(ad)                                             # Release
+        method(fac, 2)(fac)
+    except (OSError, AttributeError, ValueError):
+        pass
+    return sorted(out, key=lambda a: -a[1])          # HIP lists the big cards first and the integrated one last
+
+
+class _Pdh:
+    """Windows performance counters through pdh.dll: wildcard counter -> {instance name: value}."""
+
+    def __init__(self):
+        import ctypes.wintypes as wt
+        self.wt = wt
+        p = ctypes.windll.pdh
+        self.p = p
+        p.PdhOpenQueryW.argtypes = [wt.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wt.HANDLE)]
+        p.PdhAddEnglishCounterW.argtypes = [wt.HANDLE, wt.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wt.HANDLE)]
+        p.PdhCollectQueryData.argtypes = [wt.HANDLE]
+        p.PdhGetFormattedCounterArrayW.argtypes = [wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.DWORD),
+                                                   ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
+        self.q = wt.HANDLE()
+        if p.PdhOpenQueryW(None, 0, ctypes.byref(self.q)):
+            raise OSError("PdhOpenQuery")
+        self.counters = {}
+
+    def add(self, name, path):
+        c = self.wt.HANDLE()
+        if self.p.PdhAddEnglishCounterW(self.q, path, 0, ctypes.byref(c)):
+            raise OSError("PdhAddCounter " + path)
+        self.counters[name] = c
+
+    def collect(self):
+        self.p.PdhCollectQueryData(self.q)
+
+    def values(self, name):
+        wt = self.wt
+
+        class Item(ctypes.Structure):
+            _fields_ = [("name", wt.LPWSTR), ("status", wt.DWORD), ("value", ctypes.c_double)]
+
+        c, size, n = self.counters[name], wt.DWORD(0), wt.DWORD(0)
+        self.p.PdhGetFormattedCounterArrayW(c, 0x200, ctypes.byref(size), ctypes.byref(n), None)   # PDH_FMT_DOUBLE
+        if not size.value:
+            return {}
+        buf = ctypes.create_string_buffer(size.value)
+        if self.p.PdhGetFormattedCounterArrayW(c, 0x200, ctypes.byref(size), ctypes.byref(n), buf):
+            return {}
+        # PDH_FMT_COUNTERVALUE_ITEM_W: LPWSTR name, then a PDH_FMT_COUNTERVALUE {DWORD status; double value}
+        out = {}
+        for j in range(n.value):
+            it = Item.from_buffer_copy(buf, j * ctypes.sizeof(Item))
+            if it.status in (0, 1):
+                out[it.name] = it.value
+        return out
+
+
+class _AmdWin:
+    """AMD card on Windows, with _Nvml's interface: the name and VRAM size from DXGI, load and VRAM in use from the
+    "GPU Engine" and "GPU Adapter Memory" performance counters (the ones Task Manager shows).  Temperature and power
+    are not available without AMD's own libraries, so they stay None.  The cards are the AMD adapters in DXGI order."""
+
+    def __init__(self, index=0):
+        self.info = self.pdh = None
+        try:
+            cards = _dxgi_adapters()
+            if 0 <= index < len(cards):
+                self.info = cards[index]
+                self.pdh = _Pdh()
+                self.pdh.add("eng", r"\GPU Engine(*)\Utilization Percentage")
+                self.pdh.add("mem", r"\GPU Adapter Memory(*)\Dedicated Usage")
+                self.pdh.collect()
+        except (OSError, AttributeError, ValueError):
+            self.info = self.pdh = None
+
+    def ok(self):
+        return self.info is not None and self.pdh is not None
+
+    def name(self):
+        return self.info[0]
+
+    def read(self):
+        out = {"util": None, "mem_used": None, "mem_total": self.info[1]}
+        try:
+            luid = self.info[2]
+            self.pdh.collect()
+            mem = self.pdh.values("mem")
+            used = [v for k, v in mem.items() if luid in k]
+            out["mem_used"] = int(sum(used)) if used else None
+            per_type = {}                                  # Task Manager: the busiest engine type, each type's sum
+            for k, v in self.pdh.values("eng").items():
+                if luid in k:
+                    t = k.rpartition("_engtype_")[2]
+                    per_type[t] = per_type.get(t, 0.0) + v
+            out["util"] = min(100.0, max(per_type.values())) if per_type else None
+        except (OSError, AttributeError, ValueError):
+            pass
+        return out
+
+
 def gpu_reader(index=0, amd=False):
-    """The card's readings: NVML (NVIDIA), or the amdgpu sysfs files with the AMD backend (#301)."""
-    return _Amd(index) if amd else _Nvml(index)
+    """The card's readings: NVML (NVIDIA), or with the AMD backend (#301) the amdgpu sysfs files (Linux) / DXGI and
+    performance counters (Windows)."""
+    if amd:
+        return _AmdWin(index) if WINDOWS else _Amd(index)
+    return _Nvml(index)
 
 
 def free_vram_mib(index=0, amd=False):
