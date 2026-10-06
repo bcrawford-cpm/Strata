@@ -277,21 +277,159 @@ class _Pdh:
         return out
 
 
+class _Adl:
+    """AMD's display library (atiadlxx.dll, installed with the Radeon driver): the cards in PCI-bus order with their
+    adapter index, and one ADL2_New_QueryPMLogData_Get call per card for all its sensors at once.  Shared by every
+    reader; `lib` is None when the library is missing."""
+
+    SENSORS = 256
+    TEMP_EDGE, ACTIVITY_GFX, BOARD_POWER = 8, 19, 73                     # ADL_PMLOG_SENSORS indices
+
+    class Info(ctypes.Structure):
+        _fields_ = [("Size", ctypes.c_int), ("AdapterIndex", ctypes.c_int), ("UDID", ctypes.c_char * 256),
+                    ("BusNumber", ctypes.c_int), ("DeviceNumber", ctypes.c_int), ("FunctionNumber", ctypes.c_int),
+                    ("VendorID", ctypes.c_int), ("AdapterName", ctypes.c_char * 256),
+                    ("DisplayName", ctypes.c_char * 256), ("Present", ctypes.c_int), ("Exist", ctypes.c_int),
+                    ("DriverPath", ctypes.c_char * 256), ("DriverPathExt", ctypes.c_char * 256),
+                    ("PNPString", ctypes.c_char * 256), ("OSDisplayIndex", ctypes.c_int)]
+
+    class Sensor(ctypes.Structure):
+        _fields_ = [("supported", ctypes.c_int), ("value", ctypes.c_int)]
+
+    class PmLog(ctypes.Structure):
+        pass
+
+    _inst = None
+
+    @classmethod
+    def get(cls):
+        if cls._inst is None:
+            cls._inst = cls()
+        return cls._inst
+
+    def __init__(self):
+        self.lib = self.ctx = None
+        self.cards = []                                                  # [(adapter index, bus, device)]
+        self.PmLog._fields_ = [("size", ctypes.c_int), ("sensors", self.Sensor * self.SENSORS)]
+        try:
+            lib = ctypes.CDLL("atiadlxx.dll")
+            self._alloc = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)(ctypes.cdll.msvcrt.malloc)
+            ctx = ctypes.c_void_p()
+            if lib.ADL2_Main_Control_Create(self._alloc, 1, ctypes.byref(ctx)) != 0:
+                return
+            n = ctypes.c_int()
+            if lib.ADL2_Adapter_NumberOfAdapters_Get(ctx, ctypes.byref(n)) != 0 or n.value <= 0:
+                return
+            arr = (self.Info * n.value)()
+            if lib.ADL2_Adapter_AdapterInfo_Get(ctx, arr, ctypes.c_int(ctypes.sizeof(arr))) != 0:
+                return
+            seen, cards = set(), []
+            for a in arr:                                                # one entry per adapter, not per display
+                if a.VendorID == 1002 and a.Present and (a.BusNumber, a.DeviceNumber) not in seen:
+                    seen.add((a.BusNumber, a.DeviceNumber))
+                    cards.append((a.AdapterIndex, a.BusNumber, a.DeviceNumber))
+            self.lib, self.ctx, self.cards = lib, ctx, sorted(cards, key=lambda c: c[1:])
+        except (OSError, AttributeError, ValueError):
+            self.lib = None
+
+    def pmlog(self, adapter):
+        """{sensor index: value} of the supported sensors, or None."""
+        if self.lib is None:
+            return None
+        try:
+            o = self.PmLog()
+            o.size = ctypes.sizeof(o)
+            if self.lib.ADL2_New_QueryPMLogData_Get(self.ctx, adapter, ctypes.byref(o)) != 0:
+                return None
+            return {i: o.sensors[i].value for i in range(self.SENSORS) if o.sensors[i].supported}
+        except (OSError, AttributeError, ValueError):
+            return None
+
+
+def _pcie_link(bus, device):
+    """(generation, width, highest generation) of the PCIe link of the display adapter at this bus/device, or Nones: the
+    CurrentLinkSpeed / CurrentLinkWidth / MaxLinkSpeed device properties Windows keeps for every PCIe device (SetupAPI)."""
+    import ctypes.wintypes as wt
+
+    class Guid(ctypes.Structure):
+        _fields_ = [("a", wt.DWORD), ("b", wt.WORD), ("c", wt.WORD), ("d", ctypes.c_ubyte * 8)]
+
+    class DevInfo(ctypes.Structure):
+        _fields_ = [("cb", wt.DWORD), ("cls", Guid), ("inst", wt.DWORD), ("res", ctypes.c_void_p)]
+
+    class PropKey(ctypes.Structure):
+        _fields_ = [("fmtid", Guid), ("pid", wt.DWORD)]
+
+    try:
+        sa = ctypes.WinDLL("setupapi", use_last_error=True)
+        sa.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+        sa.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(Guid), wt.LPCWSTR, wt.HWND, wt.DWORD]
+        sa.SetupDiEnumDeviceInfo.argtypes = [ctypes.c_void_p, wt.DWORD, ctypes.POINTER(DevInfo)]
+        sa.SetupDiGetDeviceRegistryPropertyW.argtypes = [ctypes.c_void_p, ctypes.POINTER(DevInfo), wt.DWORD,
+                                                         ctypes.POINTER(wt.DWORD), ctypes.c_void_p, wt.DWORD,
+                                                         ctypes.POINTER(wt.DWORD)]
+        sa.SetupDiGetDevicePropertyW.argtypes = [ctypes.c_void_p, ctypes.POINTER(DevInfo), ctypes.POINTER(PropKey),
+                                                 ctypes.POINTER(wt.DWORD), ctypes.c_void_p, wt.DWORD,
+                                                 ctypes.POINTER(wt.DWORD), wt.DWORD]
+        sa.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+        display = Guid(0x4D36E968, 0xE325, 0x11CE, (ctypes.c_ubyte * 8)(0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18))
+        h = sa.SetupDiGetClassDevsW(ctypes.byref(display), None, None, 2)          # DIGCF_PRESENT
+        if h in (None, ctypes.c_void_p(-1).value):
+            return None, None, None
+        pci = Guid(0x3AB22E31, 0x8264, 0x4B4E, (ctypes.c_ubyte * 8)(0x9A, 0xF5, 0xA8, 0xD2, 0xD8, 0xE3, 0x3E, 0x62))
+
+        def prop(info, pid):                                                       # DEVPKEY_PciDevice_* (uint32)
+            key, v, t = PropKey(pci, pid), wt.DWORD(), wt.DWORD()
+            ok = sa.SetupDiGetDevicePropertyW(h, ctypes.byref(info), ctypes.byref(key), ctypes.byref(t),
+                                              ctypes.byref(v), 4, None, 0)
+            return v.value if ok else None
+
+        def reg(info, code):                                                       # SPDRP_BUSNUMBER 0x15, _ADDRESS 0x1C
+            v = wt.DWORD()
+            ok = sa.SetupDiGetDeviceRegistryPropertyW(h, ctypes.byref(info), code, None, ctypes.byref(v), 4, None)
+            return v.value if ok else None
+        try:
+            i = 0
+            while True:
+                info = DevInfo()
+                info.cb = ctypes.sizeof(info)
+                if not sa.SetupDiEnumDeviceInfo(h, i, ctypes.byref(info)):
+                    return None, None, None
+                i += 1
+                addr = reg(info, 0x1C)                                             # (device << 16) | function
+                if reg(info, 0x15) == bus and addr is not None and addr >> 16 == device:
+                    speed, width, top = prop(info, 9), prop(info, 10), prop(info, 11)
+                    return (speed if speed and speed < 16 else None), (width or None), (top if top and top < 16 else None)
+        finally:
+            sa.SetupDiDestroyDeviceInfoList(h)
+    except (OSError, AttributeError, ValueError):
+        return None, None, None
+
+
 class _AmdWin:
-    """AMD card on Windows, with _Nvml's interface: the name and VRAM size from DXGI, load and VRAM in use from the
-    "GPU Engine" and "GPU Adapter Memory" performance counters (the ones Task Manager shows).  Temperature and power
-    are not available without AMD's own libraries, so they stay None.  The cards are the AMD adapters in DXGI order."""
+    """AMD card on Windows, with _Nvml's interface.  Name and VRAM size from DXGI; from AMD's ADL library (one
+    PMLog call per reading): load, temperature (edge) and board power; VRAM in use from the "GPU Adapter Memory"
+    counter; the PCIe link generation and width from SetupAPI.  Without ADL the load comes from the (much costlier)
+    "GPU Engine" counters, as Task Manager does it.  PCIe traffic and a power limit are not readable on Windows.
+    The cards are numbered as HIP numbers them: the big ones first, in PCI-bus order, the integrated one last."""
 
     def __init__(self, index=0):
-        self.info = self.pdh = None
+        self.info = self.pdh = self.adl = self.slot = None
         try:
             cards = _dxgi_adapters()
-            if 0 <= index < len(cards):
-                self.info = cards[index]
-                self.pdh = _Pdh()
-                self.pdh.add("eng", r"\GPU Engine(*)\Utilization Percentage")
-                self.pdh.add("mem", r"\GPU Adapter Memory(*)\Dedicated Usage")
-                self.pdh.collect()
+            if not 0 <= index < len(cards):
+                return
+            pdh = _Pdh()
+            pdh.add("mem", r"\GPU Adapter Memory(*)\Dedicated Usage")
+            adl = _Adl.get()
+            if len(adl.cards) == len(cards):                 # both see the same cards: pair them by position
+                self.slot = adl.cards[index]
+                if adl.pmlog(self.slot[0]) is not None:
+                    self.adl = adl
+            if self.adl is None:
+                pdh.add("eng", r"\GPU Engine(*)\Utilization Percentage")
+            pdh.collect()
+            self.pdh, self.info = pdh, cards[index]
         except (OSError, AttributeError, ValueError):
             self.info = self.pdh = None
 
@@ -306,15 +444,20 @@ class _AmdWin:
         try:
             luid = self.info[2]
             self.pdh.collect()
-            mem = self.pdh.values("mem")
-            used = [v for k, v in mem.items() if luid in k]
+            used = [v for k, v in self.pdh.values("mem").items() if luid in k]
             out["mem_used"] = int(sum(used)) if used else None
-            per_type = {}                                  # Task Manager: the busiest engine type, each type's sum
-            for k, v in self.pdh.values("eng").items():
-                if luid in k:
-                    t = k.rpartition("_engtype_")[2]
-                    per_type[t] = per_type.get(t, 0.0) + v
-            out["util"] = min(100.0, max(per_type.values())) if per_type else None
+            if self.adl:
+                pm = self.adl.pmlog(self.slot[0]) or {}
+                for key, sensor in (("util", _Adl.ACTIVITY_GFX), ("temp", _Adl.TEMP_EDGE), ("power", _Adl.BOARD_POWER)):
+                    out[key] = float(pm[sensor]) if sensor in pm else None
+                out["pcie_gen"], out["pcie_width"], out["pcie_gen_max"] = _pcie_link(self.slot[1], self.slot[2])
+            else:
+                per_type = {}                              # Task Manager: the busiest engine type, each type's sum
+                for k, v in self.pdh.values("eng").items():
+                    if luid in k:
+                        t = k.rpartition("_engtype_")[2]
+                        per_type[t] = per_type.get(t, 0.0) + v
+                out["util"] = min(100.0, max(per_type.values())) if per_type else None
         except (OSError, AttributeError, ValueError):
             pass
         return out
